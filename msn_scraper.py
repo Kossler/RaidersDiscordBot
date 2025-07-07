@@ -1,87 +1,124 @@
-import aiohttp
-from bs4 import BeautifulSoup
+import feedparser
 import os
-import asyncio
+import aiohttp
+from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
+from validate_url import clean_url, is_valid_url
 
-MSN_CHANNEL_URL = "https://www.msn.com/en-us/channel/source/Football%20Analysis/sr-vid-3nh2yhdmyi9p2xgx244cmsvmhtjnvsdfaug0htkndm23it7wui9s?disableErrorRedirect=true&infiniteContentCount=0"
-SEEN_FILE = "seen_msn_galleries.txt"
 
-posted_articles = set()  # URLs seen
-articles_list = []       # List of tuples (title, url, thumb) in order seen
+FEED_URL = "https://footballanalysis1.com/feed/msn-galleries/"
+SEEN_FILE = "seen_urls.txt"
+CHANNEL_URL = "https://www.msn.com/en-us/channel/source/Football%20Analysis/sr-vid-3nh2yhdmyi9p2xgx244cmsvmhtjnvsdfaug0htkndm23it7wui9s"
 
-def load_seen_articles():
-    global posted_articles, articles_list
-    if not os.path.isfile(SEEN_FILE):
-        posted_articles = set()
-        articles_list = []
-        return
+async def get_article_metadata(analysis_url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(analysis_url) as resp:
+                if resp.status != 200:
+                    return None
 
-    # We only have URLs saved, so to reconstruct title/thumb, we store minimal placeholders
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+
+                def og(prop):
+                    tag = soup.find("meta", property=f"og:{prop}")
+                    return tag["content"].strip() if tag and tag.get("content") else None
+
+                title = og("title") or "New Article"
+                description = og("description") or "New update from Football Analysis"
+                image = og("image")
+                if image:
+                    image = clean_url(image)
+                author_tag = soup.find("meta", attrs={"name": "author"})
+                author = author_tag["content"] if author_tag and author_tag.get("content") else "Football Analysis"
+
+                # Call get_msn_url here to get the MSN link if available
+                msn_url = await fetch_msn_article_url(CHANNEL_URL, title)
+                if not msn_url:
+                    print(f"[SKIP] No MSN URL found for: {title}")
+                    return None
+                
+                return {
+                    "title": title,
+                    "url": msn_url, 
+                    "description": description,
+                    "image": image if is_valid_url(image) else None,
+                    "author": author
+                }
+
+    except Exception as e:
+        print(f"[ERROR] Failed to get metadata for {analysis_url}: {e}")
+        return None
+
+
+# Load seen URLs from file
+def load_seen_urls():
+    if not os.path.exists(SEEN_FILE):
+        return set()
     with open(SEEN_FILE, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f.readlines()]
-    posted_articles = set(urls)
-    # Placeholder titles/thumbs for peek_latest_article
-    articles_list = [("MSN Gallery", url, None) for url in urls]
+        return set(line.strip() for line in f if line.strip())
 
-def save_seen_articles():
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        for _, url, _ in articles_list:
+# Save new seen URLs
+def save_seen_urls(urls):
+    with open(SEEN_FILE, "a", encoding="utf-8") as f:
+        for url in urls:
             f.write(url + "\n")
 
+seen_urls = load_seen_urls()
+
 async def fetch_articles():
-    """Fetch new MSN gallery articles.
-
-    Returns list of tuples: (title, url, thumbnail_url)
-    Only returns articles that have not been posted before.
-    """
-    global posted_articles, articles_list
-    load_seen_articles()
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(MSN_CHANNEL_URL, headers=headers) as resp:
-            if resp.status != 200:
-                raise Exception(f"Failed to fetch MSN channel page: HTTP {resp.status}")
-            html = await resp.text()
-
-    soup = BeautifulSoup(html, "html.parser")
-
+    feed = feedparser.parse(FEED_URL)
     new_articles = []
-    for a in soup.find_all("a", href=True):
-        href = a['href']
-        
-        if "msn.com" in href and "gallery" in href.lower():
-            if href in posted_articles:
-                continue
+    new_urls = []
 
-            title = a.get_text(strip=True)
-            if not title:
-                img = a.find("img", alt=True)
-                if img:
-                    title = img['alt']
-                else:
-                    title = "MSN Gallery"
+    for entry in feed.entries:
+        fa_url = entry.link.strip()
 
-            thumb = None
-            img = a.find("img", src=True)
-            if img:
-                thumb = img['src']
+        if fa_url not in seen_urls:
+            meta = await get_article_metadata(fa_url)
+            if meta:  # Only if MSN URL is found
+                seen_urls.add(fa_url)
+                new_urls.append(fa_url)
+                new_articles.append(meta)
 
-            new_articles.append((title, href, thumb))
-            posted_articles.add(href)
-            articles_list.append((title, href, thumb))
 
-    if new_articles:
-        save_seen_articles()
+    if new_urls:
+        save_seen_urls(new_urls)
 
     return new_articles
 
-async def peek_latest_article():
-    """Return the latest article previously seen, or None"""
-    load_seen_articles()
-    if not articles_list:
-        return None
-    return articles_list[-1]
+async def fetch_msn_article_url(channel_url: str, match_headline: str) -> str | None:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/114.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080}
+        )
+
+        await page.goto(channel_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector("cs-content-card", timeout=15000)
+
+        # Extract all cards with title + href
+        cards = await page.query_selector_all("cs-content-card")
+        print(f"[DEBUG] Found {len(cards)} cs-content-card elements.")
+
+        for card in cards:
+            title = await card.get_attribute("title")
+            href = await card.get_attribute("href")
+            print(f"[DEBUG] Title: {title}")
+            if title in match_headline:
+                print(f"[DEBUG] Matched Title: {title}")
+                return href
+
+            if title in match_headline + " - Football Analysis":
+                print(f"[DEBUG] Matched Title: {title}")
+                print(href)
+                return href
+
+        await browser.close()
+
+    return None

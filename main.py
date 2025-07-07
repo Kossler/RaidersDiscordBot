@@ -3,12 +3,17 @@ import logging
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from msn_scraper import fetch_articles, peek_latest_article, posted_articles
+from msn_scraper import fetch_articles
+from validate_url import is_valid_url
 
 load_dotenv(".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Parse multiple channel IDs into a list of ints
 CHANNEL_IDS = [int(cid.strip()) for cid in os.getenv("DISCORD_CHANNEL_ID", "").split(",") if cid.strip()]
+
+print("Token from ENV:", TOKEN)
+print("Channel IDs from ENV:", CHANNEL_IDS)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,53 +32,41 @@ async def post_msn_articles():
     try:
         articles = await fetch_articles()
         if not articles:
-            logger.info("No new articles found")
             return
+
         for channel_id in CHANNEL_IDS:
             channel = bot.get_channel(channel_id)
             if not channel:
-                logger.error(f"Could not find channel with ID {channel_id}")
+                logger.warning(f"Channel {channel_id} not found.")
                 continue
-            for title, url, thumb in articles:
+
+            for article in articles:
                 embed = discord.Embed(
-                    title=title,
-                    url=url,
-                    color=discord.Color.blue()
+                    title=article["title"],
+                    url=article["url"],
+                    description=article["description"],
+                    color=discord.Color.red()
                 )
-                if thumb:
-                    embed.set_thumbnail(url=thumb)
-                embed.set_footer(text="MSN Article")
+                embed.set_author(name=article["author"])
+                if is_valid_url(article.get("image")):
+                    embed.set_image(url=article["image"])
+                else:
+                    print(f"[WARN] Skipping invalid image URL: {article.get('image')}")
+
+                embed.set_footer(text="Football Analysis")
+                print(f"[DEBUG] Article URL (MSN): {article['url']!r}")
+                image_url = article.get("image")
+                print(f"[DEBUG] Image URL: {image_url!r}")
+
                 await channel.send(embed=embed)
+
+                    
     except Exception as e:
-        logger.exception(f"Error fetching or posting articles: {e}")
+        logger.exception("Error posting articles")
+
 
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("Pong!")
-
-@bot.command(name="test")
-async def test(ctx):
-    try:
-        article = await peek_latest_article()
-        if not article:
-            await ctx.send("Could not retrieve the latest article.")
-            return
-
-        title, url, thumb = article
-        embed = discord.Embed(
-            title=title,
-            url=url,
-            color=discord.Color.green()
-        )
-        if thumb:
-            embed.set_thumbnail(url=thumb)
-        embed.set_footer(text="Latest MSN Article")
-        await ctx.send(embed=embed)
-
-    except Exception as e:
-        logger.exception(f"Error fetching latest article in !test: {e}")
-        await ctx.send("An error occurred while fetching the latest article.")
-
-
 
 bot.run(TOKEN)
